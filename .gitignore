@@ -1,0 +1,8 @@
+*~
+prompts/
+/target
+**/gen/schemas
+*.log
+.DS_Store
+node_modules/
+web/node_modules/

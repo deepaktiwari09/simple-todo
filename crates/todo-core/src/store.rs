@@ -1,0 +1,817 @@
+//! The todo directory: scanning `*.md` files, detecting external changes,
+//! and writing atomically.
+
+use crate::markdown::{Block, Document};
+use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// Tab order lives next to the lists, in TOML, so it is easy to hand-edit:
+/// `order = ["Work", "Home"]`. Anything not listed follows alphabetically.
+pub const ORDER_FILE: &str = "tabs.toml";
+pub const WELCOME_FILE: &str = "Todo.md";
+/// Archived lists are moved into this subdirectory of the todo directory.
+pub const ARCHIVE_DIR: &str = "archive";
+pub const WELCOME_CONTENT: &str = "# Todo\n\n- [ ] Drag me around\n- [ ] Click a checkbox\n- [ ] Click text to edit, press Enter for a new item\n- [ ] Switch to Markdown view (⌘/Ctrl+E) and edit the raw file\n- [x] Install the app\n";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoFile {
+    /// File name without the `.md` extension. Doubles as the tab title.
+    pub name: String,
+    pub raw: String,
+    pub blocks: Vec<Block>,
+    /// Tab color from `tabs.toml` (any CSS color string), if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// Everything we keep in `tabs.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TabsFile {
+    #[serde(default)]
+    pub order: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub colors: BTreeMap<String, String>,
+}
+
+/// Everything the UI needs to render: the directory and all files in tab
+/// order, plus archived lists sorted by name (case-insensitive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub dir: String,
+    pub files: Vec<TodoFile>,
+    #[serde(default)]
+    pub archived: Vec<TodoFile>,
+}
+
+#[derive(Debug)]
+pub struct Store {
+    dir: PathBuf,
+    /// name → raw content as last seen (either read from disk or written by us).
+    files: BTreeMap<String, String>,
+    /// Same, for lists in `archive/`. A name never appears in both maps.
+    archived: BTreeMap<String, String>,
+    /// Tab order and colors from `tabs.toml` (may name files that don't exist).
+    tabs: TabsFile,
+}
+
+/// Parse `tabs.toml` leniently: any parse error, missing key, or wrongly
+/// typed entry just means "no setting" for that part. Never fails.
+pub fn parse_tabs_file(text: &str) -> TabsFile {
+    let mut seen = HashSet::new();
+    let clean = |n: &str| n.trim().trim_end_matches(".md").to_string();
+    let table = text.parse::<toml::Table>().ok();
+    let from_toml: Option<Vec<String>> = table
+        .as_ref()
+        .and_then(|t| t.get("order").and_then(|v| v.as_array()).cloned())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(clean).collect());
+    // Corrupt TOML? Salvage whatever quoted names sit inside `order = [ … ]`.
+    let raw: Vec<String> = from_toml.unwrap_or_else(|| {
+        let Some(start) = text
+            .find("order")
+            .and_then(|i| text[i..].find('[').map(|j| i + j + 1))
+        else {
+            return Vec::new();
+        };
+        let body = &text[start..];
+        let body = &body[..body.find(']').unwrap_or(body.len())];
+        body.split('"').skip(1).step_by(2).map(clean).collect()
+    });
+    let order = raw
+        .into_iter()
+        .filter(|n| !n.is_empty() && seen.insert(n.clone()))
+        .collect();
+    let colors = table
+        .as_ref()
+        .and_then(|t| t.get("colors").and_then(|v| v.as_table()))
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| v.as_str().map(|c| (clean(k), c.trim().to_string())))
+                .filter(|(k, c)| !k.is_empty() && !c.is_empty() && c.len() <= 64)
+                .collect()
+        })
+        .unwrap_or_default();
+    TabsFile { order, colors }
+}
+
+/// Just the `order` part of [`parse_tabs_file`].
+pub fn parse_order(text: &str) -> Vec<String> {
+    parse_tabs_file(text).order
+}
+
+fn load_tabs_file(dir: &Path) -> TabsFile {
+    std::fs::read_to_string(dir.join(ORDER_FILE))
+        .map(|t| parse_tabs_file(&t))
+        .unwrap_or_default()
+}
+
+fn tabs_file_text(tabs: &TabsFile) -> String {
+    let body = toml::to_string(tabs).unwrap_or_default();
+    format!(
+        "# Tab order and colors for the Todo app.\n# Lists not mentioned in `order` follow, alphabetically. Colors are any CSS color.\n{body}"
+    )
+}
+
+impl Store {
+    /// Create a store for `dir`, creating the directory (and a welcome file
+    /// if the directory is empty).
+    pub fn new(dir: impl Into<PathBuf>) -> Store {
+        let s = Store {
+            dir: dir.into(),
+            files: BTreeMap::new(),
+            archived: BTreeMap::new(),
+            tabs: TabsFile::default(),
+        };
+        s.ensure_dir();
+        s
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn set_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.dir = dir.into();
+        self.files.clear();
+        self.archived.clear();
+        self.tabs = TabsFile::default();
+        self.ensure_dir();
+    }
+
+    fn ensure_dir(&self) {
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        let has_md = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().any(|e| is_md(&e.path())))
+                .unwrap_or(false)
+        };
+        let has_md = has_md(&self.dir) || has_md(&self.archive_dir());
+        if !has_md {
+            let _ = atomic_write(&self.dir.join(WELCOME_FILE), WELCOME_CONTENT);
+        }
+    }
+
+    /// Re-read every `*.md` file. Returns `true` if anything differs from
+    /// what we last knew (including our own writes, which therefore do not
+    /// register as changes).
+    pub fn scan(&mut self) -> bool {
+        let next = read_md_files(&self.dir);
+        let mut archived = read_md_files(&self.archive_dir());
+        // A list that exists in both places is shown (and edited) as active.
+        archived.retain(|n, _| !next.contains_key(n));
+        let tabs = load_tabs_file(&self.dir);
+        let changed = next != self.files || archived != self.archived || tabs != self.tabs;
+        self.files = next;
+        self.archived = archived;
+        self.tabs = tabs;
+        changed
+    }
+
+    pub fn archive_dir(&self) -> PathBuf {
+        self.dir.join(ARCHIVE_DIR)
+    }
+
+    /// The explicit order as last read from / written to `tabs.toml`.
+    pub fn order(&self) -> &[String] {
+        &self.tabs.order
+    }
+
+    pub fn colors(&self) -> &BTreeMap<String, String> {
+        &self.tabs.colors
+    }
+
+    /// Set (or with `None`, clear) a tab's color in `tabs.toml`.
+    pub fn set_color(&mut self, name: &str, color: Option<&str>) -> Result<()> {
+        let name = sanitize_name(name)?;
+        let mut tabs = self.tabs.clone();
+        match color.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => {
+                tabs.colors.insert(name, c.chars().take(64).collect());
+            }
+            None => {
+                tabs.colors.remove(&name);
+            }
+        }
+        self.write_tabs(tabs)
+    }
+
+    /// Persist a new tab order. Names that don't exist are dropped; files not
+    /// mentioned keep following alphabetically.
+    pub fn set_order(&mut self, names: &[String]) -> Result<()> {
+        let mut seen = HashSet::new();
+        let order: Vec<String> = names
+            .iter()
+            .filter_map(|n| sanitize_name(n).ok())
+            .filter(|n| self.files.contains_key(n) && seen.insert(n.clone()))
+            .collect();
+        let mut tabs = self.tabs.clone();
+        tabs.order = order;
+        self.write_tabs(tabs)
+    }
+
+    fn write_tabs(&mut self, tabs: TabsFile) -> Result<()> {
+        if tabs == self.tabs {
+            return Ok(());
+        }
+        atomic_write(&self.dir.join(ORDER_FILE), &tabs_file_text(&tabs))?;
+        self.tabs = tabs;
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let to_files = |map: &BTreeMap<String, String>| -> Vec<TodoFile> {
+            map.iter()
+                .map(|(name, raw)| TodoFile {
+                    name: name.clone(),
+                    raw: raw.clone(),
+                    blocks: Document::parse(raw).blocks,
+                    color: self.tabs.colors.get(name).cloned(),
+                })
+                .collect()
+        };
+        let mut files = to_files(&self.files);
+        let mut archived = to_files(&self.archived);
+        archived.sort_by_cached_key(|f| f.name.to_lowercase());
+        let rank: HashMap<&str, usize> = self
+            .tabs
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        files.sort_by_cached_key(|f| {
+            (
+                rank.get(f.name.as_str()).copied().unwrap_or(usize::MAX),
+                f.name.to_lowercase(),
+            )
+        });
+        Snapshot {
+            dir: self.dir.to_string_lossy().into_owned(),
+            files,
+            archived,
+        }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.files.contains_key(name) || self.archived.contains_key(name)
+    }
+
+    pub fn is_archived(&self, name: &str) -> bool {
+        self.archived.contains_key(name)
+    }
+
+    /// Where `name.md` lives: in `archive/` if it is archived, else the todo directory.
+    pub fn path_of(&self, name: &str) -> PathBuf {
+        let dir = if self.is_archived(name) {
+            self.archive_dir()
+        } else {
+            self.dir.clone()
+        };
+        dir.join(format!("{name}.md"))
+    }
+
+    /// The in-memory map that holds `name` (archived or active).
+    fn map_for(&mut self, name: &str) -> &mut BTreeMap<String, String> {
+        if self.is_archived(name) {
+            &mut self.archived
+        } else {
+            &mut self.files
+        }
+    }
+
+    /// Write raw markdown for `name`. Returns the parsed blocks.
+    pub fn write_raw(&mut self, name: &str, raw: &str) -> Result<Vec<Block>> {
+        let name = sanitize_name(name)?;
+        let raw = raw.replace("\r\n", "\n");
+        atomic_write(&self.path_of(&name), &raw)?;
+        let blocks = Document::parse(&raw).blocks;
+        self.map_for(&name).insert(name, raw);
+        Ok(blocks)
+    }
+
+    /// Serialize `blocks` and write them for `name`. Returns the raw markdown.
+    pub fn write_blocks(&mut self, name: &str, blocks: Vec<Block>) -> Result<String> {
+        let name = sanitize_name(name)?;
+        let raw = Document::from_blocks(blocks).to_markdown();
+        atomic_write(&self.path_of(&name), &raw)?;
+        self.map_for(&name).insert(name, raw.clone());
+        Ok(raw)
+    }
+
+    pub fn create(&mut self, name: &str) -> Result<String> {
+        let name = sanitize_name(name)?;
+        if self.contains(&name) || self.path_of(&name).exists() {
+            return Err(Error::AlreadyExists(name));
+        }
+        let raw = format!("# {name}\n\n");
+        atomic_write(&self.path_of(&name), &raw)?;
+        self.files.insert(name.clone(), raw);
+        Ok(name)
+    }
+
+    /// Rename `from.md` to `to.md`. Returns the sanitized new name.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<String> {
+        let from = sanitize_name(from)?;
+        let to = sanitize_name(to)?;
+        if from == to {
+            return Ok(to);
+        }
+        let src = self.path_of(&from);
+        if !src.exists() {
+            return Err(Error::NotFound(from));
+        }
+        let dst = src.with_file_name(format!("{to}.md"));
+        // Allow case-only renames on case-insensitive filesystems.
+        let taken = (self.contains(&to) || dst.exists()) && !from.eq_ignore_ascii_case(&to);
+        if taken {
+            return Err(Error::AlreadyExists(to));
+        }
+        std::fs::rename(&src, &dst)?;
+        let map = self.map_for(&from);
+        if let Some(raw) = map.remove(&from) {
+            map.insert(to.clone(), raw);
+        }
+        let mut tabs = self.tabs.clone();
+        tabs.order = tabs
+            .order
+            .iter()
+            .map(|n| if *n == from { to.clone() } else { n.clone() })
+            .collect();
+        if let Some(c) = tabs.colors.remove(&from) {
+            tabs.colors.insert(to.clone(), c);
+        }
+        let _ = self.write_tabs(tabs);
+        Ok(to)
+    }
+
+    pub fn delete(&mut self, name: &str) -> Result<()> {
+        let name = sanitize_name(name)?;
+        let path = self.path_of(&name);
+        if !path.exists() {
+            return Err(Error::NotFound(name));
+        }
+        std::fs::remove_file(path)?;
+        self.map_for(&name).remove(&name);
+        let mut tabs = self.tabs.clone();
+        tabs.order.retain(|n| *n != name);
+        tabs.colors.remove(&name);
+        let _ = self.write_tabs(tabs);
+        Ok(())
+    }
+
+    /// Move `name.md` into `archive/`. It drops out of the tab order but
+    /// keeps its color.
+    pub fn archive(&mut self, name: &str) -> Result<()> {
+        let name = sanitize_name(name)?;
+        let Some(raw) = self.files.get(&name).cloned() else {
+            return Err(Error::NotFound(name));
+        };
+        let dst = self.archive_dir().join(format!("{name}.md"));
+        if dst.exists() {
+            return Err(Error::AlreadyExists(format!("{ARCHIVE_DIR}/{name}")));
+        }
+        std::fs::create_dir_all(self.archive_dir())?;
+        std::fs::rename(self.path_of(&name), &dst)?;
+        self.files.remove(&name);
+        self.archived.insert(name.clone(), raw);
+        let mut tabs = self.tabs.clone();
+        tabs.order.retain(|n| *n != name);
+        let _ = self.write_tabs(tabs);
+        Ok(())
+    }
+
+    /// Move `archive/name.md` back into the todo directory, as the last tab.
+    pub fn unarchive(&mut self, name: &str) -> Result<()> {
+        let name = sanitize_name(name)?;
+        let Some(raw) = self.archived.get(&name).cloned() else {
+            return Err(Error::NotFound(name));
+        };
+        let dst = self.dir.join(format!("{name}.md"));
+        if dst.exists() {
+            return Err(Error::AlreadyExists(name));
+        }
+        std::fs::rename(self.path_of(&name), &dst)?;
+        self.archived.remove(&name);
+        self.files.insert(name.clone(), raw);
+        // With an explicit order, put it at the end; otherwise it sorts alphabetically.
+        if !self.tabs.order.is_empty() {
+            let mut tabs = self.tabs.clone();
+            tabs.order = self.snapshot().files.into_iter().map(|f| f.name).collect();
+            tabs.order.retain(|n| *n != name);
+            tabs.order.push(name);
+            let _ = self.write_tabs(tabs);
+        }
+        Ok(())
+    }
+}
+
+fn read_md_files(dir: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !is_md(&path) {
+                continue;
+            }
+            let Some(name) = name_of(&path) else { continue };
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                out.insert(name, raw);
+            }
+        }
+    }
+    out
+}
+
+/// The decision half of the file watcher, kept free of threads and OS
+/// notifications so it can be unit tested: given the current config-file
+/// mtime and a store, say whether the config must be reloaded and whether the
+/// UI needs a fresh [`Snapshot`].
+#[derive(Debug, Default)]
+pub struct SyncPoller {
+    config_mtime: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct PollOutcome {
+    pub config_changed: bool,
+    pub snapshot: Option<Snapshot>,
+}
+
+impl SyncPoller {
+    pub fn new(config_mtime: Option<std::time::SystemTime>) -> Self {
+        Self { config_mtime }
+    }
+
+    /// Record that the config was (re)loaded at this mtime, so the next poll
+    /// does not report it again.
+    pub fn mark_config(&mut self, mtime: Option<std::time::SystemTime>) {
+        self.config_mtime = mtime;
+    }
+
+    pub fn poll(
+        &mut self,
+        store: &mut Store,
+        config_mtime: Option<std::time::SystemTime>,
+    ) -> PollOutcome {
+        let config_changed = config_mtime != self.config_mtime;
+        self.config_mtime = config_mtime;
+        let snapshot = store.scan().then(|| store.snapshot());
+        PollOutcome {
+            config_changed,
+            snapshot,
+        }
+    }
+}
+
+fn is_md(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("md"))
+            .unwrap_or(false)
+        && !path
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with('.'))
+            .unwrap_or(true)
+}
+
+fn name_of(path: &Path) -> Option<String> {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// Tab/file names may not contain path separators or be empty/hidden.
+pub fn sanitize_name(name: &str) -> Result<String> {
+    let name = name.trim().trim_end_matches(".md").trim();
+    if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', '\0']) || name == ".."
+    {
+        return Err(Error::InvalidName(name.to_string()));
+    }
+    Ok(name.to_string())
+}
+
+/// Write via a temp file + rename so watchers/readers never see a torn file.
+pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::InvalidName(path.display().to_string()))?;
+    std::fs::create_dir_all(dir)?;
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_store() -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "todo-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (Store::new(&dir), dir)
+    }
+
+    #[test]
+    fn creates_welcome_file_and_scans() {
+        let (mut s, dir) = tmp_store();
+        assert!(s.scan());
+        let snap = s.snapshot();
+        assert_eq!(snap.files.len(), 1);
+        assert_eq!(snap.files[0].name, "Todo");
+        assert!(!s.scan(), "second scan must report no change");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn own_writes_do_not_count_as_changes_but_external_do() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        s.write_blocks("Todo", vec![Block::task("one")]).unwrap();
+        assert!(!s.scan());
+        std::fs::write(dir.join("Todo.md"), "- [x] external\n").unwrap();
+        assert!(s.scan());
+        assert_eq!(
+            s.snapshot().files[0].blocks,
+            vec![Block::Task {
+                done: true,
+                text: "external".into(),
+                indent: "".into()
+            }]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn create_delete_and_sanitize() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        assert_eq!(s.create("Work.md").unwrap(), "Work");
+        assert!(s.create("Work").is_err());
+        assert!(s.create("../evil").is_err());
+        assert!(s.create(".hidden").is_err());
+        assert!(dir.join("Work.md").exists());
+        s.delete("Work").unwrap();
+        assert!(!dir.join("Work.md").exists());
+        assert!(s.delete("Work").is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rename() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        s.write_raw("Todo", "- [ ] keep me\n").unwrap();
+        assert_eq!(s.rename("Todo", "Life.md").unwrap(), "Life");
+        assert!(dir.join("Life.md").exists() && !dir.join("Todo.md").exists());
+        assert!(!s.scan(), "rename must not register as an external change");
+        assert_eq!(s.snapshot().files[0].name, "Life");
+        assert_eq!(s.snapshot().files[0].raw, "- [ ] keep me\n");
+        assert!(s.rename("Nope", "X").is_err());
+        s.create("Work").unwrap();
+        assert!(s.rename("Life", "Work").is_err(), "must not clobber");
+        assert!(s.rename("Life", "../x").is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn names(s: &Store) -> Vec<String> {
+        s.snapshot().files.into_iter().map(|f| f.name).collect()
+    }
+
+    #[test]
+    fn order_file_is_lenient() {
+        assert!(parse_order("").is_empty());
+        assert!(parse_order("this is = not toml [").is_empty());
+        assert!(parse_order("other = 1").is_empty());
+        assert!(parse_order("order = 5").is_empty());
+        assert_eq!(
+            parse_order("order = [\"A\", \"B\"\ngarbage = [[["),
+            vec!["A", "B"]
+        );
+        assert_eq!(
+            parse_order("order = [\"A\", \"B\"] \n = broken"),
+            vec!["A", "B"]
+        );
+        assert_eq!(
+            parse_order("order = [\"B\", 3, \"A.md\", \"\", \"B\"]"),
+            vec!["B", "A"]
+        );
+    }
+
+    #[test]
+    fn tab_order_applies_then_alphabetical() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        for n in ["Alpha", "beta", "Gamma"] {
+            s.create(n).unwrap();
+        }
+        assert_eq!(names(&s), vec!["Alpha", "beta", "Gamma", "Todo"]);
+        s.set_order(&["Gamma".into(), "Ghost".into(), "beta".into()])
+            .unwrap();
+        assert_eq!(names(&s), vec!["Gamma", "beta", "Alpha", "Todo"]);
+        assert!(!s.scan(), "own order write is not an external change");
+        assert!(dir.join(ORDER_FILE).exists());
+
+        // External edit (partial list) is picked up; unknown names are ignored.
+        std::fs::write(dir.join(ORDER_FILE), "order = [\"Todo\", \"Nope\"]\n").unwrap();
+        assert!(s.scan());
+        assert_eq!(names(&s), vec!["Todo", "Alpha", "beta", "Gamma"]);
+
+        // Corrupt file: fall back to alphabetical, no error.
+        std::fs::write(dir.join(ORDER_FILE), "order = [[[").unwrap();
+        assert!(s.scan());
+        assert_eq!(names(&s), vec!["Alpha", "beta", "Gamma", "Todo"]);
+
+        // Rename and delete keep the order file in sync.
+        s.set_order(&["Gamma".into(), "Alpha".into()]).unwrap();
+        s.rename("Gamma", "Delta").unwrap();
+        assert_eq!(names(&s), vec!["Delta", "Alpha", "beta", "Todo"]);
+        s.delete("Delta").unwrap();
+        assert_eq!(s.order(), &["Alpha".to_string()]);
+        assert_eq!(names(&s), vec!["Alpha", "beta", "Todo"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tab_colors_round_trip_and_survive_rename() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        s.create("Work").unwrap();
+        s.set_color("Work", Some("#3e63dd")).unwrap();
+        assert!(!s.scan(), "own color write is not an external change");
+        let work = |s: &Store| {
+            s.snapshot()
+                .files
+                .into_iter()
+                .find(|f| f.name == "Work")
+                .unwrap()
+        };
+        assert_eq!(work(&s).color.as_deref(), Some("#3e63dd"));
+        s.rename("Work", "Jobs").unwrap();
+        assert_eq!(s.colors().get("Jobs").map(String::as_str), Some("#3e63dd"));
+        s.set_color("Jobs", None).unwrap();
+        assert!(s.colors().is_empty());
+        // Hand-written file with a bad entry: good ones survive, bad ones are ignored.
+        std::fs::write(
+            dir.join(ORDER_FILE),
+            "order = [\"Jobs\"]\n[colors]\nJobs = \"tomato\"\nTodo = 5\n",
+        )
+        .unwrap();
+        assert!(s.scan());
+        assert_eq!(s.colors().len(), 1);
+        assert_eq!(s.snapshot().files[0].color.as_deref(), Some("tomato"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sanitize_name_edge_cases() {
+        assert_eq!(sanitize_name("  Work.md ").unwrap(), "Work");
+        assert_eq!(sanitize_name("a.b.md").unwrap(), "a.b");
+        assert_eq!(sanitize_name("with spaces").unwrap(), "with spaces");
+        for bad in ["", "   ", ".md", ".hidden", "..", "a/b", "a\\b", "nul\0"] {
+            assert!(sanitize_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn atomic_write_reports_unwritable_parent() {
+        let (_s, dir) = tmp_store();
+        let file_as_dir = dir.join("Todo.md").join("nested.md");
+        assert!(atomic_write(&file_as_dir, "x").is_err());
+        assert!(!dir.join(".nested.md").exists(), "no temp file left behind");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn poller_reports_external_changes_and_config_mtime_once() {
+        use std::time::{Duration, SystemTime};
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        let t0 = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        let mut p = SyncPoller::new(t0);
+        // Nothing happened: quiet.
+        assert_eq!(p.poll(&mut s, t0), PollOutcome::default());
+        // Our own write is not a change.
+        s.write_raw("Todo", "- [ ] mine\n").unwrap();
+        assert_eq!(p.poll(&mut s, t0), PollOutcome::default());
+        // External write: snapshot.
+        std::fs::write(dir.join("Todo.md"), "- [x] theirs\n").unwrap();
+        let out = p.poll(&mut s, t0);
+        assert!(!out.config_changed);
+        assert_eq!(out.snapshot.unwrap().files[0].raw, "- [x] theirs\n");
+        // Config mtime moved: reported exactly once.
+        let t1 = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        assert!(p.poll(&mut s, t1).config_changed);
+        assert!(!p.poll(&mut s, t1).config_changed);
+        // Config file vanished (None) is also a change; mark_config suppresses it.
+        p.mark_config(None);
+        assert!(!p.poll(&mut s, None).config_changed);
+        // tabs.toml edits count as changes too.
+        std::fs::write(dir.join(ORDER_FILE), "order = [\"Todo\"]\n").unwrap();
+        assert!(p.poll(&mut s, None).snapshot.is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tabs_file_more_lenient_cases() {
+        let f = parse_tabs_file("order = [\"A\"]\ncolors = 5\n");
+        assert_eq!(f.order, vec!["A"]);
+        assert!(f.colors.is_empty());
+        let f = parse_tabs_file("[colors]\n\"Work.md\" = \"#fff\"\nEmpty = \"\"\n");
+        assert!(f.order.is_empty());
+        assert_eq!(f.colors.get("Work").map(String::as_str), Some("#fff"));
+        assert!(!f.colors.contains_key("Empty"));
+        let long = format!("[colors]\nA = \"{}\"\n", "x".repeat(100));
+        assert!(
+            parse_tabs_file(&long).colors.is_empty(),
+            "overlong colors are dropped"
+        );
+    }
+
+    #[test]
+    fn archive_and_unarchive() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        for n in ["Alpha", "Beta"] {
+            s.create(n).unwrap();
+        }
+        s.set_order(&["Beta".into(), "Todo".into(), "Alpha".into()])
+            .unwrap();
+        s.set_color("Beta", Some("tomato")).unwrap();
+        s.archive("Beta").unwrap();
+        assert!(dir.join(ARCHIVE_DIR).join("Beta.md").exists());
+        assert!(!dir.join("Beta.md").exists());
+        assert!(!s.scan(), "archiving is not an external change");
+        let snap = s.snapshot();
+        assert_eq!(names(&s), vec!["Todo", "Alpha"]);
+        assert_eq!(snap.archived.len(), 1);
+        assert_eq!(snap.archived[0].color.as_deref(), Some("tomato"));
+        assert!(s.archive("Beta").is_err(), "already archived");
+
+        // Archived lists stay editable, in place.
+        s.write_raw("Beta", "- [ ] archived edit\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(ARCHIVE_DIR).join("Beta.md")).unwrap(),
+            "- [ ] archived edit\n"
+        );
+        assert!(!dir.join("Beta.md").exists());
+        assert!(s.create("Beta").is_err(), "name is taken by the archive");
+        assert!(!s.scan());
+
+        // Unarchive: back as the last tab, color intact.
+        s.unarchive("Beta").unwrap();
+        assert!(dir.join("Beta.md").exists());
+        assert_eq!(names(&s), vec!["Todo", "Alpha", "Beta"]);
+        assert!(s.snapshot().archived.is_empty());
+        assert!(s.unarchive("Beta").is_err());
+
+        // Deleting an archived list removes the archived file.
+        s.archive("Alpha").unwrap();
+        s.delete("Alpha").unwrap();
+        assert!(!dir.join(ARCHIVE_DIR).join("Alpha.md").exists());
+        assert!(s.snapshot().archived.is_empty());
+
+        // Externally dropped into archive/: picked up; a same-named active file wins.
+        std::fs::write(dir.join(ARCHIVE_DIR).join("Old.md"), "x\n").unwrap();
+        std::fs::write(dir.join(ARCHIVE_DIR).join("Todo.md"), "dup\n").unwrap();
+        assert!(s.scan());
+        let arch: Vec<String> = s.snapshot().archived.into_iter().map(|f| f.name).collect();
+        assert_eq!(arch, vec!["Old"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn all_archived_does_not_recreate_welcome_file() {
+        let (mut s, dir) = tmp_store();
+        s.scan();
+        s.archive("Todo").unwrap();
+        s.set_dir(&dir);
+        assert!(!dir.join(WELCOME_FILE).exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hidden_and_non_md_ignored() {
+        let (mut s, dir) = tmp_store();
+        std::fs::write(dir.join(".secret.md"), "- [ ] x").unwrap();
+        std::fs::write(dir.join("notes.txt"), "- [ ] x").unwrap();
+        s.scan();
+        assert_eq!(s.snapshot().files.len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

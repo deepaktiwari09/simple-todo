@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- Dev harness: runs ui/ in a normal browser against a mocked Tauri backend.
+     Build with `cd web && npm run build`, serve the repo root
+     (`python3 -m http.server 8765`) and open
+     http://localhost:8765/tools/harness/harness.html
+     ?autotest runs the scenario suite (results in <pre id="results">);
+     ?md ?tab=Work ?scheme=molokai_dark ?wrap ?colors ?badge=ratio ?demo=inside ?tags ?light ?archived tweak the fixture. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Todo harness</title>
+  <link rel="stylesheet" href="../../ui/style.css" />
+  <style>
+    html, body { background: #4a6a8a url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="20" height="20" fill="%23557799"/><rect x="20" y="20" width="20" height="20" fill="%23557799"/></svg>'); }
+    .app { position: absolute; left: 40px; top: 40px; width: 380px; height: 540px; inset: auto; }
+    #results { position: absolute; left: 440px; top: 40px; color: #fff; font: 12px/1.4 monospace; white-space: pre-wrap; }
+  </style>
+  <script src="harness.js"></script>
+</head>
+<body>
+  <div id="app-root"></div>
+  <script>
+    // Pull the markup out of ui/index.html so the harness never drifts from it.
+    fetch('../../ui/index.html').then((r) => r.text()).then((html) => {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      document.getElementById('app-root').replaceWith(doc.getElementById('app'));
+      const s = document.createElement('script'); s.src = '../../ui/app.js';
+      s.onload = () => window.__harness.afterAppLoad();
+      document.body.append(s);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,284 @@
+/** The tab strip: rendering, badges, switching, reordering, renaming, colors. */
+import { commitEdit } from './edit.ts';
+import { flushMd } from './editor.ts';
+import { BADGE_MODES, badgeText, TAB_COLORS, taskCounts } from './model.ts';
+import { applySnapshot, refreshView } from './snapshot.ts';
+import { activeIsArchived, badgeMode, el, file, S, suppressClicks, targetEl } from './state.ts';
+import { invoke } from './tauri.ts';
+import { confirmDialog, showMenu, toast } from './ui.ts';
+
+export function renderTabs(): void {
+  if (!S.snap) return;
+  el.tabs.textContent = '';
+  for (const f of S.snap.files) {
+    const b = document.createElement('button');
+    b.className = 'tab' + (f.name === S.active ? ' active' : '');
+    b.textContent = f.name;
+    const badge = badgeText(f.blocks, badgeMode());
+    if (badge) { const sp = document.createElement('span'); sp.className = 'badge'; sp.textContent = badge; b.append(sp); }
+    b.dataset.name = f.name;
+    b.title = f.name + '.md  (double-click to rename, right-click for menu)';
+    if (f.color) { b.dataset.color = f.color; b.style.setProperty('--tab-color', f.color); }
+    el.tabs.append(b);
+  }
+  el.tabs.querySelector('.tab.active')?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  renderArchive();
+}
+
+/** The archive button (only when something is archived) and the "viewing an archived list" bar. */
+function renderArchive(): void {
+  const n = S.snap?.archived.length ?? 0;
+  const viewing = activeIsArchived();
+  el.archiveBtn.hidden = n === 0;
+  el.archiveBtn.classList.toggle('active', viewing);
+  el.archiveBtn.title = `Archived lists (${n})`;
+  el.archivedBar.hidden = !viewing;
+  el.archivedName.textContent = viewing ? S.active : '';
+}
+
+/** Refresh just the active tab's badge (cheap; used after toggles). */
+export function updateActiveBadge(): void {
+  renderBadgeButton();
+  if (badgeMode() === 'none') return;
+  const f = file();
+  const tab = f && tabFor(f.name);
+  if (!f || !tab) return;
+  const text = badgeText(f.blocks, badgeMode());
+  let sp = tab.querySelector('.badge');
+  if (text && !sp) { sp = document.createElement('span'); sp.className = 'badge'; tab.append(sp); }
+  if (sp) { if (text) sp.textContent = text; else sp.remove(); }
+}
+
+/**
+ * The bottom-bar toggle shows a progress ring for the active list plus a live
+ * preview of the badge in the current format ("1/6", "17%", "(5)") or "off".
+ * Clicking cycles the format for every tab.
+ */
+export function renderBadgeButton(): void {
+  const mode = badgeMode();
+  const f = file();
+  const { total, done } = f ? taskCounts(f.blocks) : { total: 0, done: 0 };
+  const frac = total ? done / total : 0;
+  const r = 5.5, c = 2 * Math.PI * r;
+  const ring = `<svg class="ring" viewBox="0 0 16 16" aria-hidden="true">
+    <circle cx="8" cy="8" r="${r}" fill="none" stroke="currentColor" stroke-opacity=".25" stroke-width="2"/>
+    <circle cx="8" cy="8" r="${r}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+      stroke-dasharray="${c.toFixed(2)}" stroke-dashoffset="${(c * (1 - frac)).toFixed(2)}" transform="rotate(-90 8 8)"/>
+  </svg>`;
+  const sample = mode === 'none' ? 'off' : (f && total ? badgeText(f.blocks, mode) : { ratio: '3/5', percent: '60%', remaining: '(2)' }[mode]);
+  el.badgeBtn.innerHTML = ring + `<span class="sample">${sample}</span>`;
+  el.badgeBtn.classList.toggle('active', mode !== 'none');
+  el.badgeBtn.classList.toggle('placeholder', mode !== 'none' && !(f && total));
+  const next = BADGE_MODES[(BADGE_MODES.indexOf(mode) + 1) % BADGE_MODES.length];
+  const names = { none: 'off', ratio: 'completed/total', percent: 'percent done', remaining: '(remaining)' };
+  el.badgeBtn.title = `Progress next to tab titles: ${names[mode]}. Click for ${names[next]}.`;
+}
+
+export const tabFor = (name: string): HTMLElement | null => el.tabs.querySelector<HTMLElement>(`.tab[data-name="${CSS.escape(name)}"]`);
+
+export function setActive(name: string | null): void {
+  if (name === S.active) return;
+  void flushMd();
+  if (S.editing) commitEdit();
+  S.active = name;
+  S.selected = null;
+  localStorage.setItem('active', name ?? '');
+  renderTabs();
+  refreshView();
+  renderBadgeButton();
+}
+
+el.tabs.addEventListener('click', (e) => {
+  if (S.suppressClick) return;
+  const t = targetEl(e).closest<HTMLElement>('.tab');
+  if (t) setActive(t.dataset.name ?? null);
+});
+
+/* ── reordering: drag a tab left/right; order persists in tabs.toml ── */
+interface TabDrag { tab: HTMLElement; x: number; y: number; active: boolean }
+let tabDrag: TabDrag | null = null;
+
+el.tabs.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  const tab = targetEl(e).closest<HTMLElement>('.tab');
+  if (!tab) return;
+  tabDrag = { tab, x: e.clientX, y: e.clientY, active: false };
+});
+window.addEventListener('pointermove', (e) => {
+  if (!tabDrag) return;
+  if (!tabDrag.active) {
+    if (Math.hypot(e.clientX - tabDrag.x, e.clientY - tabDrag.y) < 6) return;
+    tabDrag.active = true;
+    tabDrag.tab.classList.add('dragging');
+    document.body.classList.add('is-dragging');
+  }
+  const tr = el.tabs.getBoundingClientRect();
+  if (e.clientX < tr.left + 16) el.tabs.scrollLeft -= 8;
+  else if (e.clientX > tr.right - 16) el.tabs.scrollLeft += 8;
+  let target: Element | null = null;
+  for (const t of el.tabs.querySelectorAll('.tab:not(.dragging)')) {
+    const b = t.getBoundingClientRect();
+    if (e.clientX < b.left + b.width / 2) { target = t; break; }
+  }
+  if (target) { if (tabDrag.tab.nextElementSibling !== target) el.tabs.insertBefore(tabDrag.tab, target); }
+  else if (el.tabs.lastElementChild !== tabDrag.tab) el.tabs.append(tabDrag.tab);
+});
+async function endTabDrag(): Promise<void> {
+  if (!tabDrag) return;
+  const d = tabDrag; tabDrag = null;
+  if (!d.active) return;
+  d.tab.classList.remove('dragging');
+  document.body.classList.remove('is-dragging');
+  suppressClicks();
+  const names = [...el.tabs.querySelectorAll<HTMLElement>('.tab')].map((t) => t.dataset.name ?? '');
+  if (!S.snap || names.join('\n') === S.snap.files.map((f) => f.name).join('\n')) return;
+  try { applySnapshot(await invoke('set_tab_order', { names })); } catch (e) { toast(e); renderTabs(); }
+}
+window.addEventListener('pointerup', () => void endTabDrag());
+window.addEventListener('pointercancel', () => void endTabDrag());
+
+/* ── rename / create ───────────────────────────────────── */
+el.tabs.addEventListener('dblclick', (e) => {
+  const t = targetEl(e).closest<HTMLElement>('.tab');
+  if (t) renameTabPrompt(t);
+});
+
+export function renameTabPrompt(tab: HTMLElement): void {
+  if (el.tabs.querySelector('.tab-input')) return;
+  const oldName = tab.dataset.name ?? '';
+  const inp = document.createElement('input');
+  inp.className = 'tab-input';
+  inp.value = oldName;
+  inp.style.width = Math.max(90, tab.offsetWidth + 20) + 'px';
+  tab.replaceWith(inp);
+  inp.focus();
+  inp.select();
+  let done = false;
+  const finish = async (commit: boolean): Promise<void> => {
+    if (done) return; done = true;
+    const name = inp.value.trim();
+    inp.remove();
+    if (!commit || !name || name === oldName) { renderTabs(); return; }
+    try {
+      const res = await invoke('rename_file', { from: oldName, to: name });
+      if (S.active === oldName) { S.active = res.name; localStorage.setItem('active', res.name); }
+      applySnapshot(res.snapshot);
+      renderTabs();
+      refreshView();
+    } catch (err) { toast(err); renderTabs(); }
+  };
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') void finish(true);
+    else if (e.key === 'Escape') void finish(false);
+    e.stopPropagation();
+  });
+  inp.addEventListener('blur', () => void finish(true));
+}
+
+export function newListPrompt(): void {
+  if (el.tabs.querySelector('.tab-input')) return;
+  const inp = document.createElement('input');
+  inp.className = 'tab-input';
+  inp.placeholder = 'List name';
+  el.tabs.append(inp);
+  inp.scrollIntoView({ inline: 'nearest' });
+  inp.focus();
+  let done = false;
+  const finish = async (create: boolean): Promise<void> => {
+    if (done) return; done = true;
+    const name = inp.value.trim();
+    inp.remove();
+    if (!create || !name) return;
+    try {
+      const res = await invoke('create_file', { name });
+      S.active = res.name;
+      localStorage.setItem('active', res.name);
+      applySnapshot(res.snapshot);
+      renderTabs();
+      refreshView();
+    } catch (err) { toast(err); }
+  };
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') void finish(true);
+    else if (e.key === 'Escape') void finish(false);
+    e.stopPropagation();
+  });
+  inp.addEventListener('blur', () => void finish(true));
+}
+el.newTab.addEventListener('click', newListPrompt);
+
+/* ── context menu: rename / color / delete ─────────────── */
+el.tabs.addEventListener('contextmenu', (e) => {
+  const t = targetEl(e).closest<HTMLElement>('.tab');
+  if (!t || !S.snap) return;
+  e.preventDefault();
+  const name = t.dataset.name ?? '';
+  const current = S.snap.files.find((f) => f.name === name)?.color || null;
+  showMenu(e.clientX, e.clientY, [
+    { label: 'Rename…', onClick: () => { const tab = tabFor(name); if (tab) renameTabPrompt(tab); } },
+    { label: 'Color…', items: [
+      { label: 'None', color: null, checked: !current, onClick: () => void setTabColor(name, null) },
+      ...TAB_COLORS.map(([label, color]) => ({ label, color, checked: current === color, onClick: () => void setTabColor(name, color) })),
+    ] },
+    { label: 'Archive list', onClick: () => void archiveList(name) },
+    { sep: true },
+    { label: 'Delete…', danger: true, onClick: () => void deleteListPrompt(name) },
+  ]);
+});
+
+export async function setTabColor(name: string, color: string | null): Promise<void> {
+  try { applySnapshot(await invoke('set_tab_color', { name, color })); renderTabs(); } catch (err) { toast(err); }
+}
+
+export async function deleteListPrompt(name: string): Promise<void> {
+  if (await confirmDialog(`Delete the list "${name}" and its file ${name}.md?`)) {
+    // Leaving an archived list: fall back to the first tab rather than staying in the archive.
+    if (S.active === name && activeIsArchived()) setActive(S.snap?.files[0]?.name ?? null);
+    try { applySnapshot(await invoke('delete_file', { name })); } catch (err) { toast(err); }
+  }
+}
+
+/* ── archive: lists moved to archive/, opened from the archive menu ── */
+export async function archiveList(name: string): Promise<void> {
+  if (!S.snap) return;
+  // Archiving the open list: move to its neighbour tab, like closing it.
+  if (S.active === name) {
+    const names = S.snap.files.map((f) => f.name), i = names.indexOf(name);
+    setActive(names[i + 1] ?? names[i - 1] ?? null);
+  }
+  try { applySnapshot(await invoke('archive_file', { name })); renderTabs(); } catch (err) { toast(err); }
+}
+
+export async function unarchiveList(name: string): Promise<void> {
+  try { applySnapshot(await invoke('unarchive_file', { name })); renderTabs(); } catch (err) { toast(err); }
+}
+
+/** Close a temporarily opened archived list (back to the first tab). */
+export function closeArchived(): void {
+  if (activeIsArchived()) setActive(S.snap?.files[0]?.name ?? null);
+}
+
+export function showArchiveMenu(x: number, y: number): void {
+  const archived = S.snap?.archived ?? [];
+  showMenu(x, y, archived.map((f) => ({
+    label: f.name + ' ›',
+    checked: f.name === S.active,
+    ...(f.color ? { color: f.color } : {}),
+    items: [
+      { label: 'Open', onClick: () => setActive(f.name) },
+      { label: 'Unarchive', onClick: () => void unarchiveList(f.name) },
+      { sep: true },
+      { label: 'Delete…', danger: true, onClick: () => void deleteListPrompt(f.name) },
+    ],
+  })));
+}
+
+el.archiveBtn.addEventListener('click', () => {
+  const r = el.archiveBtn.getBoundingClientRect();
+  showArchiveMenu(r.left, r.bottom + 4);
+});
+el.archivedBar.addEventListener('click', (e) => {
+  const action = targetEl(e).closest<HTMLElement>('[data-action]')?.dataset.action;
+  if (action === 'unarchive' && S.active) void unarchiveList(S.active);
+  else if (action === 'close') closeArchived();
+});
